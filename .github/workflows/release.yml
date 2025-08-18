@@ -5,7 +5,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: '0 0 1 * *'
+    - cron: '0 0 1 * *' # chạy đầu tháng
   workflow_dispatch:
 
 jobs:
@@ -17,36 +17,74 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Check and build Packages
+        shell: bash
         run: |
-          set -e
-          rm -f Packages Packages.gz scan.log
-          
-          # 1. Lọc bỏ .deb bị hỏng (dpkg-deb không đọc được control)
-          for f in *.deb; do
+          set -euo pipefail
+          rm -f Packages Packages.gz scan.log tmp.log removed.list
+
+          echo "🔎 Pre-check: remove .deb that dpkg-deb cannot read"
+          # dùng find -print0 để an toàn với tên có dấu cách
+          while IFS= read -r -d '' f; do
             echo "Checking $f ..."
             if ! dpkg-deb -I "$f" >/dev/null 2>&1; then
-              echo "❌ Error in $f → removing"
-              rm -rf "$f"
+              echo "❌ dpkg-deb failed: removing $f"
+              rm -f -- "$f"
             else
               echo "✅ OK: $f"
             fi
-          done
-          
-          # 2. Build Packages, nếu fail thì xoá .deb lỗi rồi retry
-          until dpkg-scanpackages -m . /dev/null > Packages 2> scan.log; do
-            echo "⚠️ dpkg-scanpackages failed, removing broken .deb ..."
-            grep '\.deb' scan.log | while read -r line; do
-              BAD_DEB=$(echo "$line" | grep -o '[^ ]*\.deb' || true)
-              if [ -n "$BAD_DEB" ]; then
-                echo "❌ Removing invalid package: $BAD_DEB"
-                rm -f "$BAD_DEB"
+          done < <(find . -maxdepth 1 -type f -name "*.deb" -print0)
+
+          echo "📦 Build Packages with iterative per-file checks (safe)"
+          MAX_ROUNDS=10
+          round=0
+
+          while true; do
+            round=$((round+1))
+            echo "Attempt #$round: running dpkg-scanpackages..."
+            # thử build toàn bộ
+            if dpkg-scanpackages -m . /dev/null > Packages 2> scan.log; then
+              echo "✅ dpkg-scanpackages succeeded"
+              break
+            fi
+
+            echo "⚠️ dpkg-scanpackages failed on attempt #$round. Inspecting packages to find culprits..."
+            # nếu vượt quá giới hạn vòng lặp -> in log và fail để debug
+            if [ "$round" -gt "$MAX_ROUNDS" ]; then
+              echo "❌ Reached max rounds ($MAX_ROUNDS). Dumping scan.log and failing."
+              sed -n '1,200p' scan.log || true
+              exit 1
+            fi
+
+            # tìm từng .deb gây lỗi bằng cách thử dpkg-scanpackages trên từng file riêng
+            # => sẽ catch chính xác file gây lỗi (với tên có space vẫn ok)
+            removed_any=0
+            while IFS= read -r -d '' debfile; do
+              # chạy dpkg-scanpackages trên 1 file (stdout ignore). Nếu fail => xóa file
+              if ! dpkg-scanpackages -m "$debfile" /dev/null > /dev/null 2> tmp.log; then
+                echo "❌ Removing broken package: $debfile"
+                rm -f -- "$debfile"
+                echo "$debfile" >> removed.list
+                removed_any=1
               fi
-            done
+            done < <(find . -maxdepth 1 -type f -name "*.deb" -print0)
+
+            if [ "$removed_any" -eq 0 ]; then
+              echo "❌ No broken package detected by per-file check, but dpkg-scanpackages still fails."
+              echo "---- scan.log ----"
+              sed -n '1,200p' scan.log || true
+              echo "---- tmp.log (last per-file test) ----"
+              sed -n '1,200p' tmp.log || true
+              exit 1
+            fi
+
+            echo "Removed packages listed in removed.list:"
+            sed -n '1,200p' removed.list || true
+            echo "Retrying dpkg-scanpackages..."
           done
-          
-          # 3. Tạo Packages.gz cho apt
+
+          # nén Packages cho apt
           gzip -c9 Packages > Packages.gz
-          echo "✅ Packages build done"
+          echo "✅ Packages.gz created"
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v3
